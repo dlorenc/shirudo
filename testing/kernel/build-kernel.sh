@@ -17,6 +17,8 @@ usage: ${0##*/} [options]
       --config-only      apply patches and verify .config, then stop
       --fragment FILE    merge another config fragment after the CI ones
                          (repeatable; e.g. kernel-kasan.conf)
+      --patch FILE       git-am another patch after the carried ones
+                         (repeatable; e.g. the revert of an upstream fix)
   -h, --help
 
 Environment: CC/HOSTCC are not read; MAKEFLAGS is passed through.
@@ -43,6 +45,7 @@ JOBS="$(nproc)"
 LLVM_VER=""
 CONFIG_ONLY=0
 EXTRA_FRAGMENTS=()
+EXTRA_PATCHES=()
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -52,6 +55,7 @@ while [ $# -gt 0 ]; do
 	--llvm) LLVM_VER="$2"; shift 2 ;;
 	--config-only) CONFIG_ONLY=1; shift ;;
 	--fragment) EXTRA_FRAGMENTS+=("$(realpath -- "$2")"); shift 2 ;;
+	--patch) EXTRA_PATCHES+=("$(realpath -- "$2")"); shift 2 ;;
 	-h|--help) usage; exit 0 ;;
 	*) usage >&2; die "unknown argument: $1" ;;
 	esac
@@ -110,7 +114,7 @@ read -r SHA <"$REPO/bpf-next.commit"
 UPSTREAM=https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git
 SRC="$OUT/src"
 OBJ="$OUT/obj-$ARCH"
-if [ ! -d "$SRC/.git" ]; then
+if [ ! -e "$SRC/.git" ]; then
 	git init -q "$SRC"
 fi
 if ! git -C "$SRC" cat-file -e "$SHA^{commit}" 2>/dev/null; then
@@ -118,7 +122,7 @@ if ! git -C "$SRC" cat-file -e "$SHA^{commit}" 2>/dev/null; then
 	git -C "$SRC" fetch --no-tags --shallow-since=2026-09-06 "$UPSTREAM" "$SHA"
 fi
 git -C "$SRC" checkout --detach --quiet "$SHA"
-PATCHES=("$REPO"/patches/*.patch)
+PATCHES=("$REPO"/patches/*.patch ${EXTRA_PATCHES[@]+"${EXTRA_PATCHES[@]}"})
 AM_DATE="$(git -C "$SRC" log -1 --format=%cd --date=raw "$SHA")"
 for p in "${PATCHES[@]}"; do
 	log "applying $(basename "$p")"

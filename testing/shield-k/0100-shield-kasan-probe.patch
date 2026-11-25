@@ -1,0 +1,66 @@
+From 28512cfba81217a4fab287e45ce4385d80af1cdd Mon Sep 17 00:00:00 2001
+From: shield-k <shield-k@build-variant>
+Date: Wed, 25 Nov 2026 19:53:30 +0000
+Subject: [PATCH] shield-k: test-only KASAN probe sysctl
+
+---
+ lib/Makefile             |  1 +
+ lib/shield_kasan_probe.c | 37 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 38 insertions(+)
+ create mode 100644 lib/shield_kasan_probe.c
+
+diff --git a/lib/Makefile b/lib/Makefile
+index a2afe95480..cb1109bce2 100644
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@ -350,3 +350,4 @@ CONTEXT_ANALYSIS_test_context-analysis.o := y
+ obj-$(CONFIG_CONTEXT_ANALYSIS_TEST) += test_context-analysis.o
+ 
+ subdir-$(CONFIG_FORTIFY_SOURCE) += test_fortify
++obj-$(CONFIG_KASAN) += shield_kasan_probe.o
+diff --git a/lib/shield_kasan_probe.c b/lib/shield_kasan_probe.c
+new file mode 100644
+index 0000000000..4670a9f6ce
+--- /dev/null
++++ b/lib/shield_kasan_probe.c
+@@ -0,0 +1,37 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Test-only: writing kernel.shield_kasan_probe does a slab OOB write. */
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/sysctl.h>
++
++static int shield_kasan_probe(const struct ctl_table *table, int write,
++			      void *buffer, size_t *lenp, loff_t *ppos)
++{
++	volatile char *p;
++	volatile size_t i = 16;
++
++	if (!write)
++		return 0;
++	p = kmalloc(16, GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++	p[i] = 1;
++	kfree((void *)p);
++	*ppos += *lenp;
++	return 0;
++}
++
++static const struct ctl_table shield_kasan_probe_table[] = {
++	{
++		.procname	= "shield_kasan_probe",
++		.mode		= 0200,
++		.proc_handler	= shield_kasan_probe,
++	},
++};
++
++static int __init shield_kasan_probe_init(void)
++{
++	register_sysctl_init("kernel", shield_kasan_probe_table);
++	return 0;
++}
++late_initcall(shield_kasan_probe_init);
+-- 
+2.53.0
+

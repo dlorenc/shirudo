@@ -30,48 +30,46 @@ def sh(args, timeout=120, inp=None):
     return {"rc": rc, "out": out, "err": err, "secs": round(time.monotonic() - t0, 3)}
 
 
-def numbers(v, skip=("key", "cpu", "n_cpus", "max_entries", "schema", "index", "id")):
-    """Sum every integer leaf that is not a key or metadata."""
-    if isinstance(v, bool):
-        return 0
-    if isinstance(v, int):
-        return v
-    if isinstance(v, list):
-        return sum(numbers(x) for x in v)
-    if isinstance(v, dict):
-        return sum(numbers(x) for k, x in v.items() if k not in skip)
-    return 0
+def read_all():
+    """One `upatch map --all --peek` call: {(upatch, map): summed value}.
 
-
-def read_map(upatch, name):
-    r = sh([SHIRUDO, "upatch", "map", upatch, name, "--json"])
-    if r["rc"] == 0:
-        try:
-            doc = json.loads(r["out"].strip().splitlines()[-1])
-            entries = doc.get("entries", doc.get("values", doc))
-            return {"sum": numbers(entries), "raw": r["out"][:2000]}
-        except (ValueError, IndexError, AttributeError):
-            pass
-    # Human output: sum the numbers after "value"/"=" or ":" on each line.
-    h = sh([SHIRUDO, "upatch", "map", upatch, name, "--show-full"])
-    if h["rc"] != 0:
-        return {"sum": None, "raw": (r["err"] + h["err"])[:2000]}
-    total = 0
-    for line in h["out"].splitlines():
-        m = re.search(r"(?:value|val|count)\W*[:=]\s*(\d+)", line, re.I)
+    Maps without a Lua decoder have no JSON form, so this parses the human
+    output: a "Name:"/"Map:" header per map, then "key=<k>: sum=<n>" for a
+    per-CPU map or "key=<k>: <n>"/"value=<n>" for a plain one.
+    """
+    r = sh([SHIRUDO, "upatch", "map", "--all", "--peek", "--show-full"])
+    vals, raw = {}, {}
+    cur = upatch = None
+    for line in r["out"].splitlines():
+        m = re.match(r"\s*Name:\s+(\S+)", line)
         if m:
-            total += int(m.group(1))
-    return {"sum": total, "raw": h["out"][:2000]}
+            upatch = m.group(1)
+            continue
+        m = re.match(r"\s*Map:\s+(\S+)", line)
+        if m:
+            cur = (upatch, m.group(1))
+            vals[cur] = 0
+            raw[cur] = ""
+            continue
+        if cur is None:
+            continue
+        raw[cur] += line + "\n"
+        m = re.match(r"\s*key=[^:]+:\s*(?:sum=|value=)?(-?\d+)\s*$", line)
+        if m:
+            vals[cur] += int(m.group(1))
+    return vals, raw, r
 
 
 def snapshot(man):
+    vals, raw, r = read_all()
     snap = {}
     for role in ("guard", "oracle"):
         u = man[role]["name"]
         for key in ("hits", "activity"):
             m = man["maps"][f"{role}_{key}"]
             if m:
-                snap[f"{role}_{key}"] = read_map(u, m)
+                snap[f"{role}_{key}"] = {"sum": vals.get((u, m)),
+                                         "raw": raw.get((u, m), r["err"])[:400]}
     return snap
 
 

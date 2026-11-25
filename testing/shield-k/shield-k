@@ -44,6 +44,10 @@ export TEST_VM_HOST_PRIVATE_DIR="${TEST_VM_HOST_PRIVATE_DIR:-$HOME/.shirudo-test
 KEYS="$TEST_VM_HOST_PRIVATE_DIR/operator-keys/keys"
 [ -f "$ROOT/build/vm-toolchain.env" ] && . "$ROOT/build/vm-toolchain.env"
 export SHIRUDO_BUILD="$ROOT/tools/shirudo-build/shirudo-build"
+# The cell host runs the build container's distribution (Ubuntu 26.04), so
+# bundles build in the checkout; rootless podman needs subuids OS Login
+# users lack.
+export BUILD_CONTAINER="${BUILD_CONTAINER:-0}"
 
 die() { echo "shield-k: $*" >&2; exit 2; }
 log() { echo "shield-k: $(date -u +%H:%M:%S) $*" >&2; }
@@ -60,6 +64,7 @@ INPUTS=()
 WORKLOADS=()
 
 kernel_vars() {
+	KERNEL_IMAGE="$ROOT/artifacts/bpf-next-kernel-debs/bzImage"
 	case "$KERNEL" in
 	bpf-next) MAKEVARS=() ;;
 	*)
@@ -67,6 +72,7 @@ kernel_vars() {
 		[ "$KERNEL" = kasan ] && dir="$ROOT/artifacts/bpf-next-kasan-kernel-debs"
 		[ -s "$dir/bzImage" ] || die "kernel variant $KERNEL is not staged in $dir"
 		local tag="${dir##*/}"
+		KERNEL_IMAGE="$dir/bzImage"
 		MAKEVARS=("VM_KERNEL_TAG=${tag%-kernel-debs}" "VM_KERNEL_ARTIFACT_DIR=$dir")
 		;;
 	esac
@@ -84,15 +90,27 @@ vm_stop() {
 	make -s -C "$ROOT/testing" vm-stop VM_NAME="$VM_NAME" >/dev/null 2>&1 || true
 }
 
+# run.sh refuses to boot a VM_NAME whose state is still on disk.
+vm_clean() {
+	make -s -C "$ROOT/testing" vm-clean VM_NAME="$VM_NAME" >/dev/null 2>&1 || true
+	rm -rf -- "$VM_DIR"
+}
+
 vm_up() {
 	if [ "$FRESH" = 1 ] && vm_running; then
 		log "stopping $VM_NAME for a fresh boot"
+		vm_stop
+	fi
+	# A variant restaged since the VM booted needs a fresh boot.
+	if vm_running && [ "$KERNEL_IMAGE" -nt "$VM_DIR/qemu.pid" ]; then
+		log "kernel $KERNEL was restaged after $VM_NAME booted; rebooting"
 		vm_stop
 	fi
 	if vm_running; then
 		BOOT_SECS=0
 		return
 	fi
+	[ ! -e "$VM_DIR" ] || vm_clean
 	log "booting $VM_NAME (kernel $KERNEL)"
 	local t0
 	t0=$(now)
@@ -228,7 +246,7 @@ vm)
 	mkdir -p "$ROOT/build/shield-k"
 	case "$sub" in
 	up) vm_up ;;
-	down) vm_stop ;;
+	down) vm_stop; vm_clean ;;
 	status) if vm_running; then echo "$VM_NAME running"; else echo "$VM_NAME stopped"; fi ;;
 	ssh) vm_ssh "$@" ;;
 	*) die "vm up|down|status|ssh" ;;
