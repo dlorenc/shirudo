@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# shield-k -- kernel cell harness for shirudos (shirudo-spike). Runs on the
+# cell host (an x86-64 KVM host with this checkout built), never in the VM.
+#
+#   shield-k try     <guard.bpf.c> <oracle.bpf.c> <reproducer> [options]
+#   shield-k enforce <guard.bpf.c> <oracle.bpf.c> <reproducer> [options]
+#   shield-k vm up|down|status|ssh [--kernel <variant>]
+#
+# try      builds the guard with -DSHIELD_RECORD (would-refuse is counted,
+#          nothing refused) and the oracle, loads both in the test VM, runs
+#          each input with counter snapshots around it, and prints THE TABLE
+#          (guard would refuse x oracle fired) as JSON and markdown.
+# enforce  the same with the enforce build: reports refused / oracle silent /
+#          KASAN silent per input.
+#
+# Options:
+#   --kasan               same as --kernel kasan
+#   --kernel <variant>    bpf-next (default, the pinned CI kernel) or kasan
+#                         (artifacts/bpf-next-kasan-kernel-debs), or any
+#                         <v> with artifacts/<v>-kernel-debs staged
+#   --input <file>        another attacker input (kind "attack"), repeatable
+#   --workload <file>     a workload (kind "workload"), repeatable
+#   --repeat <n>          run each input n times (default 1)
+#   --guard-maps <h>,<a>  guard maps for would-refuse and activity
+#                         (default shield_hits,shield_activity; see shield.h)
+#   --oracle-maps <h>,<a> oracle maps for hits and activity (default hits,activity)
+#   --fresh               boot a fresh VM even if one is running
+#   --keep-dirty          keep the VM after a run that changed kernel taint
+#
+# Inputs ending .py run under python3, .sh under sh, anything else is exec'd.
+# Each run's files are in build/shield-k/runs/<id>/ (table.json, table.md,
+# raw.json). Exit 0 when the table passes.
+#
+# Per-input attribution is by counter deltas around each input, run one at a
+# time; background activity on the same hooks inside the VM is attributed
+# to whichever input was running.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+HERE="$ROOT/testing/shield-k"
+export TEST_VM_HOST_PRIVATE_DIR="${TEST_VM_HOST_PRIVATE_DIR:-$HOME/.shirudo-test-vm-private}"
+KEYS="$TEST_VM_HOST_PRIVATE_DIR/operator-keys/keys"
+[ -f "$ROOT/build/vm-toolchain.env" ] && . "$ROOT/build/vm-toolchain.env"
+export SHIRUDO_BUILD="$ROOT/tools/shirudo-build/shirudo-build"
+
+die() { echo "shield-k: $*" >&2; exit 2; }
+log() { echo "shield-k: $(date -u +%H:%M:%S) $*" >&2; }
+now() { date +%s.%N; }
+since() { awk -v a="$1" -v b="$(now)" 'BEGIN { printf "%.1f", b - a }'; }
+
+KERNEL=bpf-next
+FRESH=0
+KEEP_DIRTY=0
+REPEAT=1
+GUARD_MAPS=shield_hits,shield_activity
+ORACLE_MAPS=hits,activity
+INPUTS=()
+WORKLOADS=()
+
+kernel_vars() {
+	case "$KERNEL" in
+	bpf-next) MAKEVARS=() ;;
+	*)
+		local dir="$ROOT/artifacts/$KERNEL-kernel-debs"
+		[ "$KERNEL" = kasan ] && dir="$ROOT/artifacts/bpf-next-kasan-kernel-debs"
+		[ -s "$dir/bzImage" ] || die "kernel variant $KERNEL is not staged in $dir"
+		local tag="${dir##*/}"
+		MAKEVARS=("VM_KERNEL_TAG=${tag%-kernel-debs}" "VM_KERNEL_ARTIFACT_DIR=$dir")
+		;;
+	esac
+	VM_NAME="sk-$KERNEL"
+	VM_DIR="$ROOT/build/test-vm/vms/$VM_NAME"
+}
+
+vm_running() {
+	local pid
+	pid=$(cat "$VM_DIR/qemu.pid" 2>/dev/null) || return 1
+	tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -qF "$VM_DIR"
+}
+
+vm_stop() {
+	make -s -C "$ROOT/testing" vm-stop VM_NAME="$VM_NAME" >/dev/null 2>&1 || true
+}
+
+vm_up() {
+	if [ "$FRESH" = 1 ] && vm_running; then
+		log "stopping $VM_NAME for a fresh boot"
+		vm_stop
+	fi
+	if vm_running; then
+		BOOT_SECS=0
+		return
+	fi
+	log "booting $VM_NAME (kernel $KERNEL)"
+	local t0
+	t0=$(now)
+	make -s -C "$ROOT/testing" vm VM_NAME="$VM_NAME" LOCAL_STACK=0 \
+		${MAKEVARS[@]+"${MAKEVARS[@]}"} >"$ROOT/build/shield-k/boot-$VM_NAME.log" 2>&1 ||
+		{ tail -40 "$ROOT/build/shield-k/boot-$VM_NAME.log" >&2; die "VM boot failed"; }
+	BOOT_SECS=$(since "$t0")
+	log "booted $VM_NAME in ${BOOT_SECS}s"
+}
+
+vm_ssh() {
+	local key="$VM_DIR/ssh/id_ed25519"
+	[ -s "$VM_DIR/ssh.key" ] && key="$(<"$VM_DIR/ssh.key")"
+	ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=5 \
+		-o StrictHostKeyChecking=accept-new -o GlobalKnownHostsFile=/dev/null \
+		-o UserKnownHostsFile="$VM_DIR/ssh/known_hosts" -o IdentityFile="$key" \
+		-o ServerAliveInterval=15 -p "$(<"$VM_DIR/ssh.port")" root@127.0.0.1 "$@"
+}
+
+build_upatch() {	# <src> <name> <out-dir> <extra-cflags>
+	local src="$1" name="$2" out="$3" cflags="$4" sha
+	(cd "$ROOT" && ./shirudo build "$src" --name "$name" --keys-dir "$KEYS" \
+		--extra-cflags "-I$HERE $cflags" -o "$out/$name.upatch") >"$out/build-$name.log" 2>&1 ||
+		{ cat "$out/build-$name.log" >&2; die "build of $name failed"; }
+	sha=$(cd "$ROOT" && ./shirudo upatch info --json "$out/$name.upatch" | jq -r .payload_sha256)
+	(cd "$ROOT" && ./shirudo build --unload "$name" --keys-dir "$KEYS" \
+		--payload-sha256 "$sha" -o "$out/$name.unload.upatch") >>"$out/build-$name.log" 2>&1 ||
+		{ cat "$out/build-$name.log" >&2; die "unload directive of $name failed"; }
+}
+
+run_shield() {	# record|enforce
+	local mode="$1" guard="$2" oracle="$3" repro="$4" t0 tb tg id run g_cflags
+	[ -s "$guard" ] && [ -s "$oracle" ] && [ -s "$repro" ] || die "guard, oracle and reproducer must exist"
+	kernel_vars
+	mkdir -p "$ROOT/build/shield-k/runs"
+	t0=$(now)
+	vm_up
+	[ -s "$KEYS/signing_key.pem" ] || die "no test VM signing key in $KEYS (boot a VM first)"
+
+	id="$(date -u +%Y%m%dT%H%M%S)-$mode-$$"
+	run="$ROOT/build/shield-k/runs/$id"
+	mkdir -p "$run/in"
+	cp "$guard" "$run/guard.bpf.c"
+	cp "$oracle" "$run/oracle.bpf.c"
+	tb=$(now)
+	g_cflags=""
+	[ "$mode" = record ] && g_cflags="-DSHIELD_RECORD"
+	build_upatch "$run/guard.bpf.c" sk-guard "$run" "$g_cflags" &
+	build_upatch "$run/oracle.bpf.c" sk-oracle "$run" "" &
+	wait %1 && wait %2 || die "build failed"
+	local build_secs
+	build_secs=$(since "$tb")
+
+	# Inputs and manifest; the guest sees the checkout at /mnt/shirudo-src.
+	local g="/mnt/shirudo-src/build/shield-k/runs/$id" inputs="[]" f n kind
+	add_input() {
+		f="$1"; kind="$2"; n="$kind-$(basename "$f")"
+		cp "$f" "$run/in/$n"
+		inputs=$(jq -c --arg n "${n%.*}" --arg k "$kind" --arg p "$g/in/$n" --argjson r "$REPEAT" \
+			'. + [{name: $n, kind: $k, path: $p, repeat: $r, timeout: 300}]' <<<"$inputs")
+	}
+	add_input "$repro" reproducer
+	for f in ${INPUTS[@]+"${INPUTS[@]}"}; do add_input "$f" attack; done
+	for f in ${WORKLOADS[@]+"${WORKLOADS[@]}"}; do add_input "$f" workload; done
+	jq -n --arg id "$id" --arg mode "$mode" --arg g "$g" --argjson inputs "$inputs" \
+		--arg gm "$GUARD_MAPS" --arg om "$ORACLE_MAPS" '{
+		run_id: $id, mode: $mode, inputs: $inputs,
+		guard: {name: "sk-guard", load: ($g + "/sk-guard.upatch"), unload: ($g + "/sk-guard.unload.upatch")},
+		oracle: {name: "sk-oracle", load: ($g + "/sk-oracle.upatch"), unload: ($g + "/sk-oracle.unload.upatch")},
+		maps: {guard_hits: ($gm | split(",")[0]), guard_activity: ($gm | split(",")[1]),
+		       oracle_hits: ($om | split(",")[0]), oracle_activity: ($om | split(",")[1])}
+	}' >"$run/manifest.json"
+
+	tg=$(now)
+	vm_ssh "python3 /mnt/shirudo-src/testing/shield-k/guest.py $g/manifest.json" >"$run/raw.json" 2>"$run/guest.err" ||
+		{ cat "$run/guest.err" >&2; die "guest run failed; see $run"; }
+	local guest_secs total
+	guest_secs=$(since "$tg")
+	total=$(since "$t0")
+	jq -n --arg vm "$VM_NAME" --arg run "$run" --arg k "$KERNEL" \
+		--argjson boot "${BOOT_SECS:-0}" --argjson build "$build_secs" \
+		--argjson guest "$guest_secs" --argjson total "$total" \
+		'{vm: $vm, run_dir: $run, kernel_variant: $k,
+		  timings: {boot: $boot, build: $build, guest: $guest, total: $total}}' >"$run/meta.json"
+	local rc=0
+	python3 "$HERE/table.py" "$run/raw.json" "$run/table" "$run/meta.json" || rc=$?
+
+	if [ "$(jq '.taint_end != .taint_start' "$run/raw.json")" = true ] && [ "$KEEP_DIRTY" = 0 ]; then
+		log "kernel taint changed; stopping $VM_NAME so the next run boots clean"
+		vm_stop
+	fi
+	if jq -e '.steps.unload_guard.rc != 0 or .steps.unload_oracle.rc != 0' "$run/raw.json" >/dev/null; then
+		log "an unload failed; stopping $VM_NAME"
+		vm_stop
+	fi
+	return "$rc"
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+try|enforce)
+	POS=()
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--kasan) KERNEL=kasan; shift ;;
+		--kernel) KERNEL="$2"; shift 2 ;;
+		--input) INPUTS+=("$(realpath -- "$2")"); shift 2 ;;
+		--workload) WORKLOADS+=("$(realpath -- "$2")"); shift 2 ;;
+		--repeat) REPEAT="$2"; shift 2 ;;
+		--guard-maps) GUARD_MAPS="$2"; shift 2 ;;
+		--oracle-maps) ORACLE_MAPS="$2"; shift 2 ;;
+		--fresh) FRESH=1; shift ;;
+		--keep-dirty) KEEP_DIRTY=1; shift ;;
+		-*) die "unknown option $1" ;;
+		*) POS+=("$(realpath -- "$1")"); shift ;;
+		esac
+	done
+	[ "${#POS[@]}" = 3 ] || die "usage: shield-k $cmd <guard.bpf.c> <oracle.bpf.c> <reproducer> [options]"
+	mode=record
+	[ "$cmd" = enforce ] && mode=enforce
+	run_shield "$mode" "${POS[@]}"
+	;;
+vm)
+	sub="${1:-status}"; shift || true
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--kasan) KERNEL=kasan; shift ;;
+		--kernel) KERNEL="$2"; shift 2 ;;
+		*) break ;;
+		esac
+	done
+	kernel_vars
+	mkdir -p "$ROOT/build/shield-k"
+	case "$sub" in
+	up) vm_up ;;
+	down) vm_stop ;;
+	status) if vm_running; then echo "$VM_NAME running"; else echo "$VM_NAME stopped"; fi ;;
+	ssh) vm_ssh "$@" ;;
+	*) die "vm up|down|status|ssh" ;;
+	esac
+	;;
+*)
+	sed -n '3,38p' "$0" | sed 's/^# \{0,1\}//'
+	exit 2
+	;;
+esac

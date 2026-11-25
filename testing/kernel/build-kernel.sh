@@ -15,6 +15,8 @@ usage: ${0##*/} [options]
   -j, --jobs N           parallel jobs (default: nproc)
       --llvm VER         LLVM version (default: newest complete version on PATH)
       --config-only      apply patches and verify .config, then stop
+      --fragment FILE    merge another config fragment after the CI ones
+                         (repeatable; e.g. kernel-kasan.conf)
   -h, --help
 
 Environment: CC/HOSTCC are not read; MAKEFLAGS is passed through.
@@ -40,6 +42,7 @@ OUT="$(cd "$REPO/../.." && pwd)/build/test-kernel"
 JOBS="$(nproc)"
 LLVM_VER=""
 CONFIG_ONLY=0
+EXTRA_FRAGMENTS=()
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -48,6 +51,7 @@ while [ $# -gt 0 ]; do
 	-j|--jobs) JOBS="$2"; shift 2 ;;
 	--llvm) LLVM_VER="$2"; shift 2 ;;
 	--config-only) CONFIG_ONLY=1; shift ;;
+	--fragment) EXTRA_FRAGMENTS+=("$(realpath -- "$2")"); shift 2 ;;
 	-h|--help) usage; exit 0 ;;
 	*) usage >&2; die "unknown argument: $1" ;;
 	esac
@@ -68,7 +72,7 @@ if [ "$CONFIG_ONLY" = 0 ]; then
 		have "$t" || die "$t is required for Debian packages"
 	done
 fi
-FRAGMENTS=("$REPO/kernel-ci.conf" "$REPO/kernel-ci.$ARCH.conf")
+FRAGMENTS=("$REPO/kernel-ci.conf" "$REPO/kernel-ci.$ARCH.conf" ${EXTRA_FRAGMENTS[@]+"${EXTRA_FRAGMENTS[@]}"})
 
 # ---------------------------------------------------------------------------
 # Toolchain

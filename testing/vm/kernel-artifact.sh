@@ -37,7 +37,7 @@ KERNEL_REPOSITORY=shirudo-dev/shirudo
 [ "${1:-}" != stage ] || [ $# -ne 2 ] || staged_from=$(realpath -- "$2")
 cd "$(dirname "$0")/../.."
 
-kernel=artifacts/bpf-next-kernel-debs
+kernel=${KERNEL_ARTIFACT_DEST:-artifacts/bpf-next-kernel-debs}
 
 # The kernel CI build carries the LSM hooks the programs of bpf/ attach to.
 # A kernel built without one passes every other check and then fails init.
