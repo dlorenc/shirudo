@@ -40,8 +40,10 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HERE="$ROOT/testing/shield-k"
-export TEST_VM_HOST_PRIVATE_DIR="${TEST_VM_HOST_PRIVATE_DIR:-$HOME/.shirudo-test-vm-private}"
-KEYS="$TEST_VM_HOST_PRIVATE_DIR/operator-keys/keys"
+# Each bundle build replaces the operator keys in its private dir and bakes
+# their cert into that bundle, so every kernel variant gets its own dir;
+# one shared dir leaves the other variants trusting a key that is gone.
+PRIVATE_BASE="${SHIELD_K_PRIVATE_BASE:-$HOME/.shirudo-test-vm-private}"
 [ -f "$ROOT/build/vm-toolchain.env" ] && . "$ROOT/build/vm-toolchain.env"
 export SHIRUDO_BUILD="$ROOT/tools/shirudo-build/shirudo-build"
 # The cell host runs the build container's distribution (Ubuntu 26.04), so
@@ -65,17 +67,22 @@ WORKLOADS=()
 
 kernel_vars() {
 	KERNEL_IMAGE="$ROOT/artifacts/bpf-next-kernel-debs/bzImage"
+	local tag=bpf-next
 	case "$KERNEL" in
 	bpf-next) MAKEVARS=() ;;
 	*)
 		local dir="$ROOT/artifacts/$KERNEL-kernel-debs"
 		[ "$KERNEL" = kasan ] && dir="$ROOT/artifacts/bpf-next-kasan-kernel-debs"
 		[ -s "$dir/bzImage" ] || die "kernel variant $KERNEL is not staged in $dir"
-		local tag="${dir##*/}"
+		tag="${dir##*/}"
+		tag="${tag%-kernel-debs}"
 		KERNEL_IMAGE="$dir/bzImage"
-		MAKEVARS=("VM_KERNEL_TAG=${tag%-kernel-debs}" "VM_KERNEL_ARTIFACT_DIR=$dir")
+		MAKEVARS=("VM_KERNEL_TAG=$tag" "VM_KERNEL_ARTIFACT_DIR=$dir")
 		;;
 	esac
+	export TEST_VM_HOST_PRIVATE_DIR="$PRIVATE_BASE/$KERNEL"
+	KEYS="$TEST_VM_HOST_PRIVATE_DIR/operator-keys/keys"
+	BUNDLE_DIR="$ROOT/build/test-vm/host-bundle-$tag-verity"
 	VM_NAME="sk-$KERNEL"
 	VM_DIR="$ROOT/build/test-vm/vms/$VM_NAME"
 }
@@ -105,6 +112,14 @@ vm_up() {
 	if vm_running && [ "$KERNEL_IMAGE" -nt "$VM_DIR/qemu.pid" ]; then
 		log "kernel $KERNEL was restaged after $VM_NAME booted; rebooting"
 		vm_stop
+	fi
+	if ! cmp -s "$KEYS/cert.der" "$BUNDLE_DIR/fixtures/cert.der"; then
+		# The bundle trusts another key: rebuild it and reboot.
+		rm -f -- "$BUNDLE_DIR/.stamp"
+		if vm_running; then
+			log "$VM_NAME trusts a key that is not in $KEYS; rebooting"
+			vm_stop
+		fi
 	fi
 	if vm_running; then
 		BOOT_SECS=0
